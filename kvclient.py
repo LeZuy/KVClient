@@ -5,6 +5,9 @@ import hashlib
 from dataclasses import dataclass
 from transformers.cache_utils import DynamicCache
 
+H0 = bytes(32)
+KV_STORAGE_DIR = "./kv_storages"
+
 @dataclass
 class KVSegment:
     level: int
@@ -30,26 +33,30 @@ def dyadic_decomposition(n: int):
     return intervals
 
 def decompose_query(tokens):
-    result = []
+    intervals = []
     for level, index, start, end in dyadic_decomposition(len(tokens)):
         segment = tokens[start - 1:end]
-        result.append({"level": level, "index": index,
-                    "interval": (start, end), "tokens": segment})
-    return result
+        intervals.append({"level": level, "index": index,
+                          "interval": (start, end), "tokens": segment})
+    return intervals
 
-def hash_interval(h_prefix: bytes, l: int, r: int,
+def hash_interval(h_prefix: bytes, l: int, i: int,
                   model_id: str, p: str, tokens: list[int]) -> bytes:
+    profile_digest = bytes.fromhex(p)
+    if len(h_prefix) != 32:
+        raise ValueError("h_prefix is not 32 bytes")
+    elif len(profile_digest) != 32:
+        raise ValueError("profile fingerprint is not 32 bytes")
+    model_bytes = model_id.encode("utf-8")
     h = hashlib.sha256()
     h.update(h_prefix)
-    h.update(struct.pack(">QQ", l, r))
-    h.update(model_id.encode())
-    h.update(b"\x00")
-    h.update(p.encode())
-    h.update(b"\x00")
-
+    h.update(struct.pack(">QQ", l, i))
+    h.update(struct.pack(">I", len(model_bytes)))
+    h.update(model_bytes)
+    h.update(profile_digest)
+    h.update(struct.pack(">Q", len(tokens)))
     for token in tokens:
         h.update(struct.pack(">I", token))
-
     return h.digest()
 
 def slice_layer_kv(k, v, interval):
@@ -84,26 +91,31 @@ def all_dyintervals(n: int):
         intervals.append((level, index, start, end))
     return intervals
 
-def save(tokens, past_key_values, output_dir="./kv_storages"):
-    os.makedirs(output_dir, exist_ok=True)
+def save(Q: list, m: str, p: str, KV: DynamicCache) -> list[dict]:
+    os.makedirs(KV_STORAGE_DIR, exist_ok=True)
     saved = []
-    for level, index, start, end in all_dyintervals(len(tokens)):
-        kv = slice_kv_cache(past_key_values, (start, end))
-        path = output_dir + f"/kv_cache_lv{level}_idx{index}.pt"
+    h_prefix = {0: H0}
+    for l, i, start, end in all_dyintervals(len(Q)):
+        h_j = hash_interval(h_prefix[start - 1], l, i, m, p, Q[start - 1:end])
+        h_prefix[end] = h_j
+        kv = slice_kv_cache(KV, (start, end))
+        path = KV_STORAGE_DIR + f"/{h_j.hex()}.pt"
         torch.save(kv, path)
-        saved.append({"level": level,
-                      "index": index,
+        saved.append({"level": l,
+                      "index": i,
                       "interval": (start, end),
                       "path": path
                     })
-        print(f"Saved [{start},{end}] level={level}, index={index}")
+        print(f"Saved [{start},{end}] level={l}, index={i}")
     return saved
 
-def find(tokens):
+def find(Q: list, m: str, p: str) -> DynamicCache:
     cache = DynamicCache()
     kv_segs = []
-    for item in decompose_query(tokens):
-        path = f"./kv_storages/kv_cache_lv{item['level']}_idx{item['index']}.pt"
+    h_j = H0
+    for l, i, start, end in dyadic_decomposition(len(Q)):
+        h_j = hash_interval(h_j, l, i, m, p, Q[start - 1:end])
+        path = KV_STORAGE_DIR + f"/{h_j.hex()}.pt"
         print(f"Finding file: {path}")
         kv_segs.append(torch.load(path))
 
