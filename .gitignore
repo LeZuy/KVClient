@@ -1,3 +1,7 @@
+# Data folders
+kv_storages/
+logs/
+slurm
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
