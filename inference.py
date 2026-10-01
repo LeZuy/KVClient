@@ -1,5 +1,8 @@
+import copy
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
+
+from profile import extract_profile
 from kvclient import decompose_query, save, find
 
 MODEL = "Qwen/Qwen3-8B"
@@ -24,13 +27,14 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(MODEL, local_files_only=True)
     model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16, local_files_only=True)
     model.eval()
+    model_profile = extract_profile(model)
 
     inputs = tokenizer(PROMPT1, return_tensors="pt").to(model.device)
     with torch.inference_mode():
         outputs1 = model(**inputs, use_cache=True, return_dict=True)
     print(f"Input:{inputs}")
     print(f"Decomposed query: {decompose_query(inputs['input_ids'][0].tolist())}")
-    save(inputs['input_ids'][0].tolist(), outputs1.past_key_values)
+    save(inputs['input_ids'][0].tolist(), MODEL, model_profile,outputs1.past_key_values)
     
     inputs = tokenizer(PROMPT2, return_tensors="pt").to(model.device)
     with torch.inference_mode():
@@ -40,17 +44,24 @@ if __name__ == "__main__":
 
     prefix_tokens = inputs['input_ids'][0, :-1].tolist()
     last_token = inputs['input_ids'][:, -1:]
-    cache = find(prefix_tokens)
+    cache = copy.deepcopy(find(prefix_tokens, MODEL, model_profile))
     prefix_len = len(prefix_tokens)
-    assert cache.get_seq_length() == prefix_len, (cache.get_seq_length(), prefix_len)
-    print("Before:", cache.get_seq_length())
-    kvclient_outputs = forward_with_cache(model, last_token, cache)
-    print("After:", kvclient_outputs.past_key_values.get_seq_length())
-    torch.testing.assert_close(
-        base_outputs.logits[:, -1, :].float(),
-        kvclient_outputs.logits[:, -1, :].float(),
-        rtol=1e-2,
-        atol=1e-2,
-    )
-    print("\nPASS: baseline and reused-cache logits are close.")
-        
+    src = outputs1.past_key_values          # cache gốc của PROMPT1, trước khi save
+    ref = base_outputs.past_key_values 
+    for l in range(len(ref.layers)):
+        k = cache.layers[l].keys
+        d_src = (k.float() - src.layers[l].keys[:, :, :prefix_len].float()).abs().max().item()
+        d_ref = (k.float() - ref.layers[l].keys[:, :, :prefix_len].float()).abs().max().item()
+        print(f"layer {l:2d}  vs_src={d_src:.3e}  vs_ref={d_ref:.3e}")
+
+    ref_cache = copy.deepcopy(src)
+    ref_cache.crop(prefix_len)
+    ref_out = forward_with_cache(model, last_token, ref_cache)
+    kv_out  = forward_with_cache(model, last_token, copy.deepcopy(cache))
+    assert torch.equal(ref_out.logits, kv_out.logits)   # phải bit-exact
+            # 3) So với full prefill: chỉ kiểm tra "đủ gần" theo ý nghĩa
+    a = base_outputs.logits[0, -1].float()
+    b = kv_out.logits[0, -1].float()
+    print("max |Δlogit|:", (a - b).abs().max().item())
+    assert a.argmax() == b.argmax()
+    assert torch.equal(a.topk(5).indices, b.topk(5).indices)
